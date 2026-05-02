@@ -1,0 +1,357 @@
+// 基础数据结构 / Basic data structures
+type Vec3
+    x, y, z
+
+type Color
+    r, g, b
+
+type Ray
+    origin : Vec3
+    dir    : Vec3
+
+type LightSource
+    position      : Vec3
+    color         : Color
+    power         : float
+    maxDistance   : float
+    baseRayCount  : int
+    spreadAngle   : float
+    radiusBias    : float
+    indirectScale : float
+
+type Voxel
+    solid    : bool
+    albedo   : Color
+    emissive : Color
+    opacity  : float
+
+enum FaceDir { PX, NX, PY, NY, PZ, NZ }
+
+type FaceKey
+    x, y, z
+    dir : FaceDir
+
+type FaceLight
+    direct         : Color
+    indirect       : Color
+    total          : Color
+    dirty          : bool
+    normal         : Vec3
+    center         : Vec3
+    area           : float
+    materialAlbedo : Color
+
+type Patch
+    faceKey   : FaceKey
+    center    : Vec3
+    radius    : float
+    color     : Color
+    energy    : float
+    sourceDir : Vec3
+
+type HitResult
+    hit      : bool
+    t        : float
+    position : Vec3
+    normal   : Vec3
+    faceKey  : FaceKey
+    voxel    : Voxel
+
+type World
+    function GetVoxel(x, y, z) -> Voxel
+    function IsInside(x, y, z) -> bool
+    function IsSolid(x, y, z) -> bool
+    function GetExposedFace(faceKey) -> bool
+    function GetFaceCenter(faceKey) -> Vec3
+    function GetFaceNormal(faceKey) -> Vec3
+    function GetFaceArea(faceKey) -> float
+    function GetFaceAlbedo(faceKey) -> Color
+    function RaycastVoxel(ray, maxDistance) -> HitResult
+
+
+// 颜色/向量工具 / Color & vector utilities
+function Clamp01(v : float) -> float
+    if v < 0 then return 0
+    if v > 1 then return 1
+    return v
+
+function ClampColor(c : Color) -> Color
+    return Color(Clamp01(c.r), Clamp01(c.g), Clamp01(c.b))
+
+function AddColor(a : Color, b : Color) -> Color
+    return Color(a.r + b.r, a.g + b.g, a.b + b.b)
+
+function MulColor(a : Color, s : float) -> Color
+    return Color(a.r * s, a.g * s, a.b * s)
+
+function MulColorColor(a : Color, b : Color) -> Color
+    return Color(a.r * b.r, a.g * b.g, a.b * b.b)
+
+function Length(v : Vec3) -> float
+    return sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
+
+function Normalize(v : Vec3) -> Vec3
+    len = Length(v)
+    if len <= 0 then return Vec3(0,0,0)
+    return Vec3(v.x/len, v.y/len, v.z/len)
+
+function Dot(a : Vec3, b : Vec3) -> float
+    return a.x*b.x + a.y*b.y + a.z*b.z
+
+function Sub(a : Vec3, b : Vec3) -> Vec3
+    return Vec3(a.x-b.x, a.y-b.y, a.z-b.z)
+
+function Add(a : Vec3, b : Vec3) -> Vec3
+    return Vec3(a.x+b.x, a.y+b.y, a.z+b.z)
+
+function Mul(v : Vec3, s : float) -> Vec3
+    return Vec3(v.x*s, v.y*s, v.z*s)
+
+
+// 主入口：整张图的光照构建 / Main entry: build scene lighting
+function BuildLighting(world : World, lights : array<LightSource>, maxIterations : int)
+    faceLightMap : map<FaceKey, FaceLight> = EmptyMap()
+    patchList    : array<Patch> = EmptyArray()
+
+    InitializeFaceLightMap(world, faceLightMap)
+
+    for each light in lights
+        rayCount = EstimateRayCount(light, world)
+        for i from 0 to rayCount - 1
+            ray = GenerateImportanceRay(light, i, rayCount)
+            hit = world.RaycastVoxel(ray, light.maxDistance)
+            if hit.hit == false
+                continue
+            patch = CreatePatchFromHit(light, ray, hit, world)
+            Append(patchList, patch)
+            DepositPatch(faceLightMap, patch)
+
+    PropagateIndirectLight(world, faceLightMap, maxIterations)
+    SmoothFaceLighting(world, faceLightMap, 2)
+    FinalizeFaceLighting(faceLightMap)
+
+    return faceLightMap
+
+
+// 初始化：只给暴露面建立光照缓存 / Initialize exposed-face light cache
+function InitializeFaceLightMap(world : World, faceLightMap : map<FaceKey, FaceLight>)
+    for each visible voxel face in world
+        fk = faceKey of this face
+        if world.GetExposedFace(fk) == false
+            continue
+
+        fl = FaceLight()
+        fl.direct  = Color(0,0,0)
+        fl.indirect = Color(0,0,0)
+        fl.total   = Color(0,0,0)
+        fl.dirty   = false
+        fl.normal  = world.GetFaceNormal(fk)
+        fl.center  = world.GetFaceCenter(fk)
+        fl.area    = world.GetFaceArea(fk)
+        fl.materialAlbedo = world.GetFaceAlbedo(fk)
+
+        faceLightMap[fk] = fl
+
+
+// 光线数量估计 / Estimate ray count from light
+function EstimateRayCount(light : LightSource, world : World) -> int
+    base = light.baseRayCount
+    influence = sqrt(max(light.power, 0.0001)) * light.maxDistance
+    sceneFactor = 1.0
+    count = base + int(influence * 4.0 * sceneFactor)
+    if count < 32 then count = 32
+    if count > 4096 then count = 4096
+    return count
+
+
+// 方向采样：Fibonacci 球 + 轻微扰动 / Direction sampling: Fibonacci sphere + jitter
+function GenerateImportanceRay(light : LightSource, index : int, rayCount : int) -> Ray
+    u = (index + 0.5) / rayCount
+    v = Frac(index * 0.61803398875)
+    theta = 2.0 * PI * v
+    phi   = acos(1.0 - 2.0 * u)
+    dir = Vec3(
+        sin(phi) * cos(theta),
+        cos(phi),
+        sin(phi) * sin(theta)
+    )
+    dir = BendDirectionIntoCone(dir, light.spreadAngle)
+    ray = Ray()
+    ray.origin = light.position
+    ray.dir = Normalize(dir)
+    return ray
+
+function BendDirectionIntoCone(dir : Vec3, spreadAngle : float) -> Vec3
+    return dir
+
+
+// 命中后创建 patch / Create patch from ray hit
+function CreatePatchFromHit(light : LightSource, ray : Ray, hit : HitResult, world : World) -> Patch
+    dist = hit.t
+    attenuation = light.power / (1.0 + dist * dist)
+    radius = light.radiusBias + dist * tan(light.spreadAngle)
+    if radius < 0.5 then radius = 0.5
+    area = PI * radius * radius
+    if area < 0.0001 then area = 0.0001
+    energy = attenuation / area
+    albedo = world.GetFaceAlbedo(hit.faceKey)
+    color  = MulColorColor(light.color, albedo)
+    color  = MulColor(color, energy)
+    patch = Patch()
+    patch.faceKey   = hit.faceKey
+    patch.center    = hit.position
+    patch.radius    = radius
+    patch.color     = color
+    patch.energy    = energy
+    patch.sourceDir = ray.dir
+    return patch
+
+
+// 将 patch 写入面光照缓存 / Deposit patch into face light map
+function DepositPatch(faceLightMap : map<FaceKey, FaceLight>, patch : Patch)
+    if faceLightMap contains patch.faceKey
+        fl = faceLightMap[patch.faceKey]
+        fl.direct = AddColor(fl.direct, patch.color)
+        fl.dirty = true
+        faceLightMap[patch.faceKey] = fl
+
+    nearbyFaces = GatherNearbyFaces(patch.faceKey, patch.radius)
+    for each fk in nearbyFaces
+        if faceLightMap does not contain fk
+            continue
+        fl = faceLightMap[fk]
+        dist = FaceDistanceApprox(fl.center, patch.center)
+        weight = GaussianWeight(dist, patch.radius)
+        facing = max(0, Dot(fl.normal, patch.sourceDir * -1.0))
+        addColor = MulColor(patch.color, weight * facing)
+        fl.direct = AddColor(fl.direct, addColor)
+        fl.dirty = true
+        faceLightMap[fk] = fl
+
+function GaussianWeight(distance : float, radius : float) -> float
+    sigma = radius * 0.5
+    if sigma < 0.001 then sigma = 0.001
+    x = distance / sigma
+    return exp(-0.5 * x * x)
+
+function GatherNearbyFaces(originFace : FaceKey, radius : float) -> array<FaceKey>
+    return NeighborFaceQuery(originFace, radius)
+
+
+// 邻居传播：间接光传播迭代 / Neighbor propagation: indirect light iterations
+function PropagateIndirectLight(world : World, faceLightMap : map<FaceKey, FaceLight>, maxIterations : int)
+    for iter from 0 to maxIterations - 1
+        deltaMap : map<FaceKey, Color> = EmptyMap()
+        for each (fk, fl) in faceLightMap
+            if world.GetExposedFace(fk) == false
+                continue
+            source = AddColor(fl.direct, fl.indirect)
+            neighbors = GetFaceGraphNeighbors(world, fk)
+            for each nf in neighbors
+                if faceLightMap does not contain nf
+                    continue
+                if world.GetExposedFace(nf) == false
+                    continue
+                nfl = faceLightMap[nf]
+                edgeFactor = FaceTransferFactor(world, fk, nf)
+                absorb = 1.0 - AverageColor(nfl.materialAlbedo)
+                if absorb < 0.0 then absorb = 0.0
+                if absorb > 1.0 then absorb = 1.0
+                transfer = 0.18 * edgeFactor * (1.0 - absorb)
+                add = MulColor(source, transfer)
+                if deltaMap contains nf
+                    deltaMap[nf] = AddColor(deltaMap[nf], add)
+                else
+                    deltaMap[nf] = add
+        for each (fk, addColor) in deltaMap
+            fl = faceLightMap[fk]
+            fl.indirect = AddColor(fl.indirect, addColor)
+            fl.dirty = true
+            faceLightMap[fk] = fl
+
+function GetFaceGraphNeighbors(world : World, fk : FaceKey) -> array<FaceKey>
+    return FaceAdjacencyQuery(fk)
+
+function FaceTransferFactor(world : World, a : FaceKey, b : FaceKey) -> float
+    na = world.GetFaceNormal(a)
+    nb = world.GetFaceNormal(b)
+    normalFactor = max(0.0, Dot(na, nb))
+    pa = world.GetFaceCenter(a)
+    pb = world.GetFaceCenter(b)
+    d  = Length(Sub(pa, pb))
+    distFactor = 1.0 / (1.0 + d)
+    return normalFactor * distFactor
+
+
+// 平滑：双边式去块状 / Smoothing: bilateral-style to reduce blockiness
+function SmoothFaceLighting(world : World, faceLightMap : map<FaceKey, FaceLight>, passes : int)
+    for pass from 0 to passes - 1
+        tempMap : map<FaceKey, Color> = EmptyMap()
+        for each (fk, fl) in faceLightMap
+            if world.GetExposedFace(fk) == false
+                continue
+            selfColor = AddColor(fl.direct, fl.indirect)
+            neighbors = GetFaceGraphNeighbors(world, fk)
+            sum = selfColor
+            totalWeight = 1.0
+            for each nf in neighbors
+                if faceLightMap does not contain nf
+                    continue
+                nfl = faceLightMap[nf]
+                nColor = AddColor(nfl.direct, nfl.indirect)
+                colorDiff = ColorDistance(selfColor, nColor)
+                w = 1.0 / (1.0 + colorDiff * 4.0)
+                sum = AddColor(sum, MulColor(nColor, w))
+                totalWeight = totalWeight + w
+            smoothed = MulColor(sum, 1.0 / totalWeight)
+            tempMap[fk] = smoothed
+        for each (fk, c) in tempMap
+            fl = faceLightMap[fk]
+            fl.direct = c
+            fl.indirect = Color(0,0,0)
+            faceLightMap[fk] = fl
+
+function ColorDistance(a : Color, b : Color) -> float
+    dr = a.r - b.r
+    dg = a.g - b.g
+    db = a.b - b.b
+    return sqrt(dr*dr + dg*dg + db*db)
+
+function AverageColor(c : Color) -> float
+    return (c.r + c.g + c.b) / 3.0
+
+
+// 最终收敛：生成 total / Finalize totals and clamp
+function FinalizeFaceLighting(faceLightMap : map<FaceKey, FaceLight>)
+    for each (fk, fl) in faceLightMap
+        fl.total = AddColor(fl.direct, fl.indirect)
+        fl.total = ClampColor(fl.total)
+        faceLightMap[fk] = fl
+
+
+// 渲染阶段采样 / Sampling during render
+function SampleFaceLighting(faceLightMap : map<FaceKey, FaceLight>, fk : FaceKey, uv : Vec3) -> Color
+    if faceLightMap contains fk == false
+        return Color(0,0,0)
+    fl = faceLightMap[fk]
+    return fl.total
+
+
+// 简易着色 / Simple per-face shading
+function ShadeVoxelFace(baseColor : Color, faceLight : Color, normal : Vec3, viewDir : Vec3) -> Color
+    diffuse = MulColorColor(baseColor, faceLight)
+    return ClampColor(diffuse)
+
+
+// 可选的距离相关公式 / Optional distance-based formulas
+function ComputeDistanceBasedSpotRadius(lightPower : float, dist : float) -> float
+    return 0.5 + 0.15 * dist + 0.02 * sqrt(max(lightPower, 0.0))
+
+function ComputeDistanceBasedIntensity(lightPower : float, dist : float, radius : float) -> float
+    area = PI * radius * radius
+    return lightPower / ((1.0 + dist * dist) * area)
+
+
+// 建议调用顺序 / Suggested usage
+// 每帧或光源/区块变化时： faceLightMap = BuildLighting(world, lights, 2 or 3)
+// 渲染时：对每个可见 voxel face 直接查 faceLightMap[fk].total
